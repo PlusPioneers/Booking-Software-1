@@ -3,13 +3,17 @@ const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const path = require('path');
+const compression = require('compression');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Add compression middleware
+app.use(compression());
+
 // Enable CORS for all routes
 app.use(cors({
-    origin: '*', // In production, specify your domain
+    origin: process.env.NODE_ENV === 'production' ? 'your-domain.com' : '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -17,8 +21,15 @@ app.use(cors({
 // Parse JSON bodies
 app.use(express.json());
 
-// Serve static files (your booking widget)
-app.use(express.static(path.join(__dirname, 'public')));
+// Set view engine for server-side rendering
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+
+// Serve static files with caching
+app.use(express.static(path.join(__dirname, 'public'), {
+    maxAge: process.env.NODE_ENV === 'production' ? '1d' : 0,
+    etag: true
+}));
 
 // Initialize SQLite database
 const db = new sqlite3.Database('./bookings.db', (err) => {
@@ -48,10 +59,10 @@ db.serialize(() => {
         CREATE TABLE IF NOT EXISTS doctor_availability (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             doctor_id INTEGER NOT NULL,
-            day_of_week INTEGER NOT NULL, -- 0=Sunday, 1=Monday, etc.
+            day_of_week INTEGER NOT NULL,
             start_time TEXT NOT NULL,
             end_time TEXT NOT NULL,
-            slot_duration INTEGER DEFAULT 30, -- minutes
+            slot_duration INTEGER DEFAULT 30,
             is_active INTEGER DEFAULT 1,
             FOREIGN KEY (doctor_id) REFERENCES doctors (id)
         )
@@ -97,7 +108,7 @@ db.serialize(() => {
                 ['Dr. David Kim', 'Orthopedics', '+1-555-0104'],
                 ['Dr. Lisa Thompson', 'Dermatology', '+1-555-0105']
             ];
-
+            
             const stmt = db.prepare('INSERT INTO doctors (name, department, contact) VALUES (?, ?, ?)');
             sampleDoctors.forEach(doctor => {
                 stmt.run(doctor);
@@ -109,10 +120,9 @@ db.serialize(() => {
                 db.all('SELECT id FROM doctors', (err, doctors) => {
                     if (!err) {
                         const availStmt = db.prepare(`
-                            INSERT INTO doctor_availability (doctor_id, day_of_week, start_time, end_time, slot_duration) 
+                            INSERT INTO doctor_availability (doctor_id, day_of_week, start_time, end_time, slot_duration)
                             VALUES (?, ?, ?, ?, ?)
                         `);
-                        
                         doctors.forEach(doctor => {
                             // Monday to Friday, 9 AM to 5 PM, 30-minute slots
                             for (let day = 1; day <= 5; day++) {
@@ -128,15 +138,22 @@ db.serialize(() => {
 });
 
 // Email configuration
-const transporter = nodemailer.createTransport({
+const transporter = nodemailer.createTransporter({
     host: 'smtp.gmail.com',
     port: 587,
     secure: false,
     auth: {
-        user: 'essstellers@gmail.com',
-        pass: 'thahir2005@'
+        user: process.env.EMAIL_USER || 'esstellers@gmail.com',
+        pass: process.env.EMAIL_PASS || 'thahir2005@'
     }
 });
+
+// Cache for frequently accessed data
+const cache = {
+    doctors: null,
+    doctorsTimestamp: 0,
+    cacheDuration: 5 * 60 * 1000 // 5 minutes
+};
 
 // Generate booking reference
 function generateBookingReference() {
@@ -148,18 +165,56 @@ function generateBookingReference() {
     return result;
 }
 
+// Generate time slots helper function
+function generateTimeSlots(startTime, endTime, duration) {
+    const slots = [];
+    const start = new Date(`2000-01-01 ${startTime}`);
+    const end = new Date(`2000-01-01 ${endTime}`);
+    let current = new Date(start);
+
+    while (current < end) {
+        slots.push(current.toTimeString().slice(0, 5));
+        current.setMinutes(current.getMinutes() + duration);
+    }
+    return slots;
+}
+
+// Routes
+
+// Home route - serve booking page
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public/views/booking.html'));
+});
+
+// Admin route
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public/views/admin.html'));
+});
+
 // Test route
 app.get('/api/test', (req, res) => {
     res.json({ message: 'Medical booking system is working!' });
 });
 
-// Get all doctors
+// Get all doctors with caching
 app.get('/api/doctors', (req, res) => {
+    const now = Date.now();
+    
+    // Return cached data if still valid
+    if (cache.doctors && (now - cache.doctorsTimestamp) < cache.cacheDuration) {
+        return res.json({ success: true, doctors: cache.doctors });
+    }
+    
     db.all('SELECT * FROM doctors WHERE is_active = 1 ORDER BY name', (err, doctors) => {
         if (err) {
             console.error('Error fetching doctors:', err);
             return res.status(500).json({ success: false, message: 'Error fetching doctors' });
         }
+        
+        // Update cache
+        cache.doctors = doctors;
+        cache.doctorsTimestamp = now;
+        
         res.json({ success: true, doctors });
     });
 });
@@ -180,6 +235,10 @@ app.post('/api/doctors', (req, res) => {
                 console.error('Error adding doctor:', err);
                 return res.status(500).json({ success: false, message: 'Error adding doctor' });
             }
+            
+            // Clear cache
+            cache.doctors = null;
+            
             res.json({ success: true, doctorId: this.lastID });
         }
     );
@@ -189,7 +248,7 @@ app.post('/api/doctors', (req, res) => {
 app.put('/api/doctors/:id', (req, res) => {
     const { id } = req.params;
     const { name, department, contact, is_active } = req.body;
-    
+
     db.run(
         'UPDATE doctors SET name = ?, department = ?, contact = ?, is_active = ? WHERE id = ?',
         [name, department, contact, is_active !== undefined ? is_active : 1, id],
@@ -198,6 +257,10 @@ app.put('/api/doctors/:id', (req, res) => {
                 console.error('Error updating doctor:', err);
                 return res.status(500).json({ success: false, message: 'Error updating doctor' });
             }
+            
+            // Clear cache
+            cache.doctors = null;
+            
             res.json({ success: true });
         }
     );
@@ -206,7 +269,7 @@ app.put('/api/doctors/:id', (req, res) => {
 // Get doctor availability
 app.get('/api/doctors/:id/availability', (req, res) => {
     const { id } = req.params;
-    
+
     db.all(
         'SELECT * FROM doctor_availability WHERE doctor_id = ? AND is_active = 1',
         [id],
@@ -224,17 +287,17 @@ app.get('/api/doctors/:id/availability', (req, res) => {
 app.post('/api/doctors/:id/availability', (req, res) => {
     const { id } = req.params;
     const { availability } = req.body;
-    
+
     // First, deactivate all existing availability
     db.run('UPDATE doctor_availability SET is_active = 0 WHERE doctor_id = ?', [id], (err) => {
         if (err) {
             console.error('Error updating availability:', err);
             return res.status(500).json({ success: false, message: 'Error updating availability' });
         }
-        
+
         // Insert new availability
         const stmt = db.prepare(`
-            INSERT INTO doctor_availability (doctor_id, day_of_week, start_time, end_time, slot_duration) 
+            INSERT INTO doctor_availability (doctor_id, day_of_week, start_time, end_time, slot_duration)
             VALUES (?, ?, ?, ?, ?)
         `);
         
@@ -255,10 +318,9 @@ app.post('/api/doctors/:id/availability', (req, res) => {
 // Get available time slots for a doctor on a specific date
 app.get('/api/doctors/:id/slots/:date', (req, res) => {
     const { id, date } = req.params;
-    
     const selectedDate = new Date(date);
     const dayOfWeek = selectedDate.getDay();
-    
+
     // Get doctor's availability for this day
     db.get(
         'SELECT * FROM doctor_availability WHERE doctor_id = ? AND day_of_week = ? AND is_active = 1',
@@ -268,11 +330,11 @@ app.get('/api/doctors/:id/slots/:date', (req, res) => {
                 console.error('Error fetching availability:', err);
                 return res.status(500).json({ success: false, message: 'Error checking availability' });
             }
-            
+
             if (!availability) {
                 return res.json({ success: true, availableSlots: [] });
             }
-            
+
             // Check if date is blocked
             db.get(
                 'SELECT * FROM doctor_blocked_dates WHERE doctor_id = ? AND blocked_date = ?',
@@ -282,14 +344,14 @@ app.get('/api/doctors/:id/slots/:date', (req, res) => {
                         console.error('Error checking blocked dates:', err);
                         return res.status(500).json({ success: false, message: 'Error checking availability' });
                     }
-                    
+
                     if (blocked) {
                         return res.json({ success: true, availableSlots: [] });
                     }
-                    
+
                     // Generate time slots
                     const slots = generateTimeSlots(availability.start_time, availability.end_time, availability.slot_duration);
-                    
+
                     // Get booked slots
                     db.all(
                         'SELECT appointment_time FROM bookings WHERE doctor_id = ? AND appointment_date = ? AND status != "cancelled"',
@@ -299,10 +361,10 @@ app.get('/api/doctors/:id/slots/:date', (req, res) => {
                                 console.error('Error fetching booked slots:', err);
                                 return res.status(500).json({ success: false, message: 'Error checking availability' });
                             }
-                            
+
                             const bookedTimes = bookedSlots.map(slot => slot.appointment_time);
                             const availableSlots = slots.filter(slot => !bookedTimes.includes(slot));
-                            
+
                             res.json({ success: true, availableSlots });
                         }
                     );
@@ -312,33 +374,9 @@ app.get('/api/doctors/:id/slots/:date', (req, res) => {
     );
 });
 
-// Generate time slots helper function
-function generateTimeSlots(startTime, endTime, duration) {
-    const slots = [];
-    const start = new Date(`2000-01-01 ${startTime}`);
-    const end = new Date(`2000-01-01 ${endTime}`);
-    
-    let current = new Date(start);
-    while (current < end) {
-        slots.push(current.toTimeString().slice(0, 5));
-        current.setMinutes(current.getMinutes() + duration);
-    }
-    
-    return slots;
-}
-
 // Create new booking
 app.post('/api/bookings', (req, res) => {
-    const {
-        patientName,
-        patientEmail,
-        patientPhone,
-        doctorId,
-        appointmentDate,
-        appointmentTime,
-        isFollowup,
-        notes
-    } = req.body;
+    const { patientName, patientEmail, patientPhone, doctorId, appointmentDate, appointmentTime, isFollowup, notes } = req.body;
 
     // Validate required fields
     if (!patientName || !patientPhone || !doctorId || !appointmentDate || !appointmentTime) {
@@ -352,7 +390,7 @@ app.post('/api/bookings', (req, res) => {
     const selectedDate = new Date(appointmentDate);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    
+
     if (selectedDate < today) {
         return res.status(400).json({
             success: false,
@@ -367,10 +405,7 @@ app.post('/api/bookings', (req, res) => {
         (err, existingBooking) => {
             if (err) {
                 console.error('Database error:', err);
-                return res.status(500).json({
-                    success: false,
-                    message: 'Database error occurred'
-                });
+                return res.status(500).json({ success: false, message: 'Database error occurred' });
             }
 
             if (existingBooking) {
@@ -384,18 +419,13 @@ app.post('/api/bookings', (req, res) => {
 
             // Insert new booking
             db.run(
-                `INSERT INTO bookings (patient_name, patient_email, patient_phone, doctor_id, 
-                 appointment_date, appointment_time, is_followup, notes, booking_reference) 
+                `INSERT INTO bookings (patient_name, patient_email, patient_phone, doctor_id, appointment_date, appointment_time, is_followup, notes, booking_reference)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [patientName, patientEmail || '', patientPhone, doctorId, appointmentDate, 
-                 appointmentTime, isFollowup ? 1 : 0, notes || '', bookingReference],
+                [patientName, patientEmail || '', patientPhone, doctorId, appointmentDate, appointmentTime, isFollowup ? 1 : 0, notes || '', bookingReference],
                 function(err) {
                     if (err) {
                         console.error('Insert error:', err);
-                        return res.status(500).json({
-                            success: false,
-                            message: 'Failed to save booking'
-                        });
+                        return res.status(500).json({ success: false, message: 'Failed to save booking' });
                     }
 
                     // Get doctor info for confirmation
@@ -407,49 +437,39 @@ app.post('/api/bookings', (req, res) => {
                         const doctorName = doctor ? doctor.name : 'Unknown Doctor';
 
                         // Send confirmation email if email provided
-                        if (patientEmail) {
+                        if (patientEmail && process.env.EMAIL_USER) {
                             const mailOptions = {
-                                from: 'essstellers@gmail.com',
+                                from: process.env.EMAIL_USER,
                                 to: patientEmail,
                                 subject: 'Appointment Confirmation',
                                 html: `
-                                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                                        <h2 style="color: #2563eb;">Appointment Confirmed</h2>
-                                        <p>Dear <strong>${patientName}</strong>,</p>
-                                        <p>Your appointment has been successfully booked with the following details:</p>
-                                        <div style="background: #f8fafc; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #2563eb;">
-                                            <ul style="list-style: none; padding: 0;">
-                                                <li><strong>Booking Reference:</strong> ${bookingReference}</li>
-                                                <li><strong>Doctor:</strong> ${doctorName}</li>
-                                                <li><strong>Date:</strong> ${appointmentDate}</li>
-                                                <li><strong>Time:</strong> ${appointmentTime}</li>
-                                                <li><strong>Follow-up:</strong> ${isFollowup ? 'Yes' : 'No'}</li>
-                                                ${notes ? `<li><strong>Notes:</strong> ${notes}</li>` : ''}
-                                            </ul>
-                                        </div>
-                                        <p>Please arrive 15 minutes before your scheduled appointment time.</p>
-                                        <p style="font-size: 12px; color: #64748b;">
-                                            If you need to cancel or reschedule, please contact us with your booking reference: ${bookingReference}
-                                        </p>
-                                    </div>
+                                    <h2>Appointment Confirmation</h2>
+                                    <p>Dear <strong>${patientName}</strong>,</p>
+                                    <p>Your appointment has been successfully booked with the following details:</p>
+                                    <ul>
+                                        <li><strong>Doctor:</strong> ${doctorName}</li>
+                                        <li><strong>Date:</strong> ${appointmentDate}</li>
+                                        <li><strong>Time:</strong> ${appointmentTime}</li>
+                                        <li><strong>Booking Reference:</strong> ${bookingReference}</li>
+                                    </ul>
+                                    <p>Please arrive 15 minutes before your scheduled appointment time.</p>
+                                    <p>If you need to cancel or reschedule, please contact us with your booking reference: ${bookingReference}</p>
                                 `
                             };
 
-                            transporter.sendMail(mailOptions, (emailErr, info) => {
-                                if (emailErr) {
-                                    console.log('Email sending failed:', emailErr.message);
-                                } else {
-                                    console.log('Confirmation email sent:', info.messageId);
+                            transporter.sendMail(mailOptions, (error, info) => {
+                                if (error) {
+                                    console.log('Email error:', error);
                                 }
                             });
                         }
 
                         res.json({
                             success: true,
-                            message: 'Appointment booked successfully!',
                             bookingId: this.lastID,
-                            bookingReference: bookingReference,
-                            doctorName: doctorName
+                            bookingReference,
+                            appointmentTime,
+                            message: 'Appointment booked successfully!'
                         });
                     });
                 }
@@ -458,265 +478,79 @@ app.post('/api/bookings', (req, res) => {
     );
 });
 
-// Get all bookings with doctor information
+// Get all bookings
 app.get('/api/bookings', (req, res) => {
-    const query = `
+    const { status, date, doctorId, search } = req.query;
+    let query = `
         SELECT b.*, d.name as doctor_name, d.department 
         FROM bookings b 
         JOIN doctors d ON b.doctor_id = d.id 
-        ORDER BY b.appointment_date DESC, b.appointment_time DESC
+        WHERE 1=1
     `;
-    
-    db.all(query, [], (err, bookings) => {
+    let params = [];
+
+    if (status) {
+        query += ' AND b.status = ?';
+        params.push(status);
+    }
+
+    if (date) {
+        query += ' AND b.appointment_date = ?';
+        params.push(date);
+    }
+
+    if (doctorId) {
+        query += ' AND b.doctor_id = ?';
+        params.push(doctorId);
+    }
+
+    if (search) {
+        query += ' AND (b.patient_name LIKE ? OR b.booking_reference LIKE ?)';
+        params.push(`%${search}%`, `%${search}%`);
+    }
+
+    query += ' ORDER BY b.appointment_date DESC, b.appointment_time DESC';
+
+    db.all(query, params, (err, bookings) => {
         if (err) {
             console.error('Error fetching bookings:', err);
-            return res.status(500).json({ 
-                success: false, 
-                message: 'Error fetching bookings' 
-            });
+            return res.status(500).json({ success: false, message: 'Error fetching bookings' });
         }
-        res.json({
-            success: true,
-            bookings: bookings
-        });
+        res.json({ success: true, bookings });
     });
 });
 
 // Update booking status
 app.put('/api/bookings/:id', (req, res) => {
     const { id } = req.params;
-    const { status, appointmentDate, appointmentTime, doctorId } = req.body;
-    
-    let updateQuery = 'UPDATE bookings SET ';
-    let updateParams = [];
-    let updateFields = [];
-    
+    const { status, notes } = req.body;
+
+    let query = 'UPDATE bookings SET ';
+    let params = [];
+
     if (status) {
-        if (!['confirmed', 'cancelled', 'completed', 'needs_followup'].includes(status)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid status. Must be: confirmed, cancelled, completed, or needs_followup'
-            });
-        }
-        updateFields.push('status = ?');
-        updateParams.push(status);
+        query += 'status = ?';
+        params.push(status);
     }
-    
-    if (appointmentDate) {
-        updateFields.push('appointment_date = ?');
-        updateParams.push(appointmentDate);
+
+    if (notes) {
+        if (params.length > 0) query += ', ';
+        query += 'notes = ?';
+        params.push(notes);
     }
-    
-    if (appointmentTime) {
-        updateFields.push('appointment_time = ?');
-        updateParams.push(appointmentTime);
-    }
-    
-    if (doctorId) {
-        updateFields.push('doctor_id = ?');
-        updateParams.push(doctorId);
-    }
-    
-    if (updateFields.length === 0) {
-        return res.status(400).json({
-            success: false,
-            message: 'No fields to update'
-        });
-    }
-    
-    updateQuery += updateFields.join(', ') + ' WHERE id = ?';
-    updateParams.push(id);
-    
-    db.run(updateQuery, updateParams, function(err) {
+
+    query += ' WHERE id = ?';
+    params.push(id);
+
+    db.run(query, params, function(err) {
         if (err) {
-            console.error('Update error:', err);
-            return res.status(500).json({ 
-                success: false, 
-                message: 'Error updating booking' 
-            });
+            console.error('Error updating booking:', err);
+            return res.status(500).json({ success: false, message: 'Error updating booking' });
         }
-        
-        if (this.changes === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Booking not found'
-            });
-        }
-        
-        res.json({ 
-            success: true, 
-            message: 'Booking updated successfully' 
-        });
+        res.json({ success: true });
     });
 });
 
-// Search bookings
-app.get('/api/bookings/search', (req, res) => {
-    const { query } = req.query;
-    
-    if (!query) {
-        return res.status(400).json({
-            success: false,
-            message: 'Search query is required'
-        });
-    }
-    
-    const searchQuery = `
-        SELECT b.*, d.name as doctor_name, d.department 
-        FROM bookings b 
-        JOIN doctors d ON b.doctor_id = d.id 
-        WHERE b.patient_name LIKE ? OR b.patient_phone LIKE ? OR b.booking_reference LIKE ?
-        ORDER BY b.appointment_date DESC, b.appointment_time DESC
-    `;
-    
-    const searchTerm = `%${query}%`;
-    
-    db.all(searchQuery, [searchTerm, searchTerm, searchTerm], (err, bookings) => {
-        if (err) {
-            console.error('Error searching bookings:', err);
-            return res.status(500).json({ 
-                success: false, 
-                message: 'Error searching bookings' 
-            });
-        }
-        res.json({
-            success: true,
-            bookings: bookings
-        });
-    });
-});
-
-// Get booking by reference
-app.get('/api/bookings/reference/:ref', (req, res) => {
-    const { ref } = req.params;
-    
-    const query = `
-        SELECT b.*, d.name as doctor_name, d.department 
-        FROM bookings b 
-        JOIN doctors d ON b.doctor_id = d.id 
-        WHERE b.booking_reference = ?
-    `;
-    
-    db.get(query, [ref], (err, booking) => {
-        if (err) {
-            console.error('Error fetching booking:', err);
-            return res.status(500).json({ 
-                success: false, 
-                message: 'Error fetching booking' 
-            });
-        }
-        
-        if (!booking) {
-            return res.status(404).json({
-                success: false,
-                message: 'Booking not found'
-            });
-        }
-        
-        res.json({
-            success: true,
-            booking: booking
-        });
-    });
-});
-
-// Block doctor date
-app.post('/api/doctors/:id/block-date', (req, res) => {
-    const { id } = req.params;
-    const { date, reason } = req.body;
-    
-    db.run(
-        'INSERT INTO doctor_blocked_dates (doctor_id, blocked_date, reason) VALUES (?, ?, ?)',
-        [id, date, reason || 'Unavailable'],
-        function(err) {
-            if (err) {
-                console.error('Error blocking date:', err);
-                return res.status(500).json({ success: false, message: 'Error blocking date' });
-            }
-            res.json({ success: true });
-        }
-    );
-});
-
-// Export bookings to CSV
-app.get('/api/bookings/export', (req, res) => {
-    const query = `
-        SELECT 
-            b.booking_reference,
-            b.patient_name,
-            b.patient_phone,
-            b.patient_email,
-            d.name as doctor_name,
-            d.department,
-            b.appointment_date,
-            b.appointment_time,
-            CASE WHEN b.is_followup = 1 THEN 'Yes' ELSE 'No' END as is_followup,
-            b.status,
-            b.notes,
-            b.created_at
-        FROM bookings b 
-        JOIN doctors d ON b.doctor_id = d.id 
-        ORDER BY b.appointment_date DESC, b.appointment_time DESC
-    `;
-    
-    db.all(query, [], (err, bookings) => {
-        if (err) {
-            console.error('Error exporting bookings:', err);
-            return res.status(500).json({ 
-                success: false, 
-                message: 'Error exporting bookings' 
-            });
-        }
-        
-        // Convert to CSV
-        const headers = [
-            'Booking Reference', 'Patient Name', 'Phone', 'Email', 'Doctor', 'Department',
-            'Date', 'Time', 'Follow-up', 'Status', 'Notes', 'Created At'
-        ];
-        
-        let csv = headers.join(',') + '\n';
-        
-        bookings.forEach(booking => {
-            const row = [
-                booking.booking_reference,
-                `"${booking.patient_name}"`,
-                booking.patient_phone,
-                booking.patient_email || '',
-                `"${booking.doctor_name}"`,
-                `"${booking.department}"`,
-                booking.appointment_date,
-                booking.appointment_time,
-                booking.is_followup,
-                booking.status,
-                `"${(booking.notes || '').replace(/"/g, '""')}"`,
-                booking.created_at
-            ];
-            csv += row.join(',') + '\n';
-        });
-        
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', 'attachment; filename=bookings.csv');
-        res.send(csv);
-    });
-});
-
-// Start server
 app.listen(PORT, () => {
-    console.log(`Medical booking system running on http://localhost:${PORT}`);
-    console.log(`Admin panel available at http://localhost:${PORT}/admin.html`);
-    console.log(`Booking widget available at http://localhost:${PORT}/booking-widget.html`);
-    console.log(`API test endpoint: http://localhost:${PORT}/api/test`);
-});
-
-// Gracefully close database connection on exit
-process.on('SIGINT', () => {
-    console.log('\nShutting down server...');
-    db.close((err) => {
-        if (err) {
-            console.error('Error closing database:', err.message);
-        } else {
-            console.log('Database connection closed.');
-        }
-        process.exit(0);
-    });
+    console.log(`Server running on port ${PORT}`);
 });

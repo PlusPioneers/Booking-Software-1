@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: medical-booking-system
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/test
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
